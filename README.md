@@ -1,6 +1,6 @@
 # Hyper Reader
 
-Hyper Reader ([@hyperreader_bot](https://t.me/hyperreader_bot)) is a Telegram bot that alerts when BTC falls $1,000 or more within 60 seconds.
+Hyper Reader ([@hyperreader_bot](https://t.me/hyperreader_bot)) is a Telegram bot that alerts when BTC falls fast: $1,000 or more within 60 seconds, or with `/watch drastic`, only on sudden crashes of $500 or more within 10 seconds.
 
 Prices come from the same oracle [Papertrade](https://docs.papertrade.xyz/) executes against: Hyperliquid's BBO precompile on HyperEVM (`0x000000000000000000000000000000000000080e`, asset `0` = BTC). The bot reads it with `eth_call` once a second and uses the bid/ask mid, exactly like Papertrade's `PriceOracle` (`0xa9B4c7b7Ca5835652d81E25739c870D49F39cC2e`).
 
@@ -10,9 +10,19 @@ Send these in a DM with the bot or in a group it's been added to:
 
 | Command | What it does |
 | --- | --- |
-| `/watch` | Start alerts in this chat |
+| `/watch` | Start alerts in this chat on the normal tier |
+| `/watch drastic` | Switch this chat to the drastic tier: only alert on sudden crashes |
 | `/watch off` | Stop alerts in this chat |
-| `/watch status` | Show whether this chat is watching, plus the current BTC price |
+| `/watch status` | Show this chat's tier, plus the current BTC price |
+
+Each chat is on one tier at a time. Sending `/watch` or `/watch drastic` switches it.
+
+| Tier | Alerts when BTC falls | Good for |
+| --- | --- | --- |
+| `normal` | $1,000 or more within 60s | Any sharp selloff |
+| `drastic` | $500 or more within 10s | Flash wicks and liquidation cascades only. A steady slide won't trigger it, even a big one. |
+
+Drops are measured from the highest price in the window to the current price.
 
 An alert looks like this:
 
@@ -32,9 +42,11 @@ Everything is set with environment variables.
 | --- | --- | --- |
 | `TELEGRAM_BOT_TOKEN` | required | From [@BotFather](https://t.me/BotFather) |
 | `TELEGRAM_ALLOWED_CHATS` | anyone | Comma-separated chat IDs. Commands from other chats are ignored. Chat IDs show up in the logs when someone sends `/watch`. |
-| `ALERT_DROP_USD` | `1000` | Drop that triggers an alert, measured from the highest price in the window |
-| `ALERT_WINDOW_SECONDS` | `60` | Lookback window |
-| `ALERT_COOLDOWN_SECONDS` | `120` | Minimum time between alerts |
+| `NORMAL_DROP_USD` | `1000` | Normal tier: drop that triggers an alert |
+| `NORMAL_WINDOW_SECONDS` | `60` | Normal tier: lookback window |
+| `DRASTIC_DROP_USD` | `500` | Drastic tier: drop that triggers an alert |
+| `DRASTIC_WINDOW_SECONDS` | `10` | Drastic tier: lookback window |
+| `ALERT_COOLDOWN_SECONDS` | `120` | Minimum time between alerts in each tier |
 | `POLL_INTERVAL_SECONDS` | `1` | Time between price reads |
 | `STATE_FILE` | `watchers.json` (`/data/watchers.json` in Docker) | Where the list of watching chats is saved |
 | `HYPEREVM_RPC_URL` | `https://rpc.hyperliquid.xyz/evm` | Swap in a dedicated HyperEVM RPC if the public one rate-limits you |
@@ -96,7 +108,7 @@ Requires Python 3.8+. There are no dependencies to install.
 To see an alert without waiting for a real crash, lower the trigger:
 
 ```bash
-ALERT_DROP_USD=20 ALERT_WINDOW_SECONDS=30 ALERT_COOLDOWN_SECONDS=30 python3 hyper_reader.py
+NORMAL_DROP_USD=20 NORMAL_WINDOW_SECONDS=30 DRASTIC_DROP_USD=10 DRASTIC_WINDOW_SECONDS=5 ALERT_COOLDOWN_SECONDS=30 python3 hyper_reader.py
 ```
 
 Locally, the watching chats are saved to `watchers.json` in the current directory. Delete that file to reset them.
