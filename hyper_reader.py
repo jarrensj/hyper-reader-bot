@@ -3,20 +3,20 @@
 
 Papertrade's PriceOracle reads Hyperliquid's BBO precompile on HyperEVM
 (0x...080e) and executes at the bid/ask mid. This bot makes the same read via
-eth_call, tracks the highest mid over a trailing window, and alerts every chat
-that has /watch on when the current mid is ALERT_DROP_USD or more below it.
+eth_call, tracks the highest mid over each alert tier's trailing window, and
+alerts the chats on that tier when the current mid falls far enough below it.
 
 Telegram commands:
-  /watch          start alerts in this chat
+  /watch          start alerts in this chat (normal tier)
   /watch off      stop alerts in this chat
-  /watch status   show whether this chat is watching, plus the current price
+  /watch status   show this chat's tier, plus the current price
 
 Environment:
   TELEGRAM_BOT_TOKEN       required, from @BotFather
   TELEGRAM_ALLOWED_CHATS   optional comma-separated chat IDs; commands from other chats are ignored
-  ALERT_DROP_USD           USD drop that triggers an alert (default 1000)
-  ALERT_WINDOW_SECONDS     lookback window in seconds (default 60)
-  ALERT_COOLDOWN_SECONDS   min seconds between alerts (default 120)
+  NORMAL_DROP_USD          normal tier: USD drop that triggers an alert (default 1000)
+  NORMAL_WINDOW_SECONDS    normal tier: lookback window in seconds (default 60)
+  ALERT_COOLDOWN_SECONDS   min seconds between alerts in a tier (default 120)
   POLL_INTERVAL_SECONDS    seconds between price reads (default 1)
   STATE_FILE               where watching chats are saved (default watchers.json)
   HYPEREVM_RPC_URL         HyperEVM RPC (default https://rpc.hyperliquid.xyz/evm)
@@ -38,19 +38,32 @@ BTC_ASSET = 0  # HyperCore perp index; BTC = 0 on chain 999
 BTC_PX_SCALE = 10  # precompile prices carry 6 - szDecimals(5) = 1 decimal
 FEED_DOWN_AFTER = 60  # seconds of failed reads before alerting that the feed is down
 
-DROP_USD = float(os.environ.get("ALERT_DROP_USD", 1000))
-WINDOW_SECONDS = float(os.environ.get("ALERT_WINDOW_SECONDS", 60))
+# Each watching chat is on one tier: name -> (USD drop, lookback window in seconds).
+# Override a tier with <NAME>_DROP_USD and <NAME>_WINDOW_SECONDS.
+TIER_DEFAULTS = {"normal": (1000, 60)}
+DEFAULT_TIER = "normal"
+TIERS = {
+    name: (
+        float(os.environ.get(f"{name.upper()}_DROP_USD", drop)),
+        float(os.environ.get(f"{name.upper()}_WINDOW_SECONDS", window)),
+    )
+    for name, (drop, window) in TIER_DEFAULTS.items()
+}
 COOLDOWN_SECONDS = float(os.environ.get("ALERT_COOLDOWN_SECONDS", 120))
 POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL_SECONDS", 1))
 STATE_FILE = os.environ.get("STATE_FILE", "watchers.json")
 
-TRIGGER = f"${DROP_USD:,.0f} drop within {WINDOW_SECONDS:.0f}s"
+
+def trigger(tier):
+    drop, window = TIERS[tier]
+    return f"${drop:,.0f} drop within {window:.0f}s"
+
+
 HELP = (
-    f"Hyper Reader: BTC drop alerts on a {TRIGGER}, priced off Hyperliquid's BBO mid "
-    "(the price Papertrade executes at).\n\n"
-    "/watch - start alerts in this chat\n"
-    "/watch off - stop alerts\n"
-    "/watch status - show status and current price"
+    "Hyper Reader: BTC drop alerts, priced off Hyperliquid's BBO mid (the price Papertrade executes at).\n\n"
+    + "".join(f"/watch{'' if t == DEFAULT_TIER else ' ' + t} - alert on a {trigger(t)}\n" for t in TIERS)
+    + "/watch off - stop alerts\n"
+    "/watch status - show this chat's tier and the current price"
 )
 
 
@@ -116,38 +129,44 @@ class DropDetector:
 
 
 class Watchers:
-    """Chat IDs with /watch on, saved to disk so they survive restarts."""
+    """Tier for each chat with /watch on, saved to disk so it survives restarts."""
 
     def __init__(self, path):
         self.path = path
         self.lock = threading.Lock()
+        self.tiers = {}
         try:
             with open(path) as f:
-                self.chats = set(json.load(f))
+                saved = json.load(f)
         except FileNotFoundError:
-            self.chats = set()
+            return
         except ValueError as e:
             log(f"ignoring unreadable {path}: {e}")
-            self.chats = set()
+            return
+        if isinstance(saved, list):  # saved before tiers existed: a list of chat IDs
+            saved = {chat_id: DEFAULT_TIER for chat_id in saved}
+        self.tiers = {int(chat_id): tier for chat_id, tier in saved.items() if tier in TIERS}
 
-    def __contains__(self, chat_id):
+    def tier(self, chat_id):
         with self.lock:
-            return chat_id in self.chats
+            return self.tiers.get(chat_id)
 
-    def snapshot(self):
+    def chats(self, tier=None):
+        """Chats on `tier`, or every watching chat when tier is None."""
         with self.lock:
-            return sorted(self.chats)
+            return sorted(chat_id for chat_id, t in self.tiers.items() if tier in (None, t))
 
-    def set(self, chat_id, on):
+    def set(self, chat_id, tier):
+        """Put the chat on `tier`, or stop its alerts when tier is None."""
         with self.lock:
-            if on:
-                self.chats.add(chat_id)
+            if tier:
+                self.tiers[chat_id] = tier
             else:
-                self.chats.discard(chat_id)
+                self.tiers.pop(chat_id, None)
             os.makedirs(os.path.dirname(self.path) or ".", exist_ok=True)
             tmp = self.path + ".tmp"
             with open(tmp, "w") as f:
-                json.dump(sorted(self.chats), f)
+                json.dump(self.tiers, f)
             os.replace(tmp, self.path)
 
 
@@ -171,9 +190,9 @@ class Telegram:
                 time.sleep(2 * attempt)
 
 
-def broadcast(tg, watchers, text):
+def broadcast(tg, chat_ids, text):
     # One thread per chat so a dead chat's retries don't delay everyone else.
-    for chat_id in watchers.snapshot():
+    for chat_id in chat_ids:
         threading.Thread(target=tg.send, args=(chat_id, text), daemon=True).start()
 
 
@@ -197,15 +216,20 @@ def handle_command(text, chat_id, bot_username, watchers, latest):
         return None
 
     arg = parts[1].lower() if len(parts) > 1 else "on"
-    if arg == "on":
-        watchers.set(chat_id, True)
-        return f"Watching BTC. I'll alert here on a {TRIGGER}.\n{price_line(latest)}\nSend /watch off to stop."
+    tier = DEFAULT_TIER if arg == "on" else arg
+    if tier in TIERS:
+        watchers.set(chat_id, tier)
+        return (
+            f"Watching BTC on the {tier} tier. I'll alert here on a {trigger(tier)}.\n"
+            f"{price_line(latest)}\nSend /watch off to stop."
+        )
     if arg == "off":
-        watchers.set(chat_id, False)
+        watchers.set(chat_id, None)
         return "Stopped BTC alerts in this chat. Send /watch to turn them back on."
     if arg == "status":
-        state = "ON" if chat_id in watchers else "OFF"
-        return f"Alerts: {state}\n{price_line(latest)}\nTrigger: {TRIGGER}"
+        tier = watchers.tier(chat_id)
+        state = f"ON, {tier} tier ({trigger(tier)})" if tier else "OFF"
+        return f"Alerts: {state}\n{price_line(latest)}"
     return HELP
 
 
@@ -239,7 +263,7 @@ def run_bot(tg, bot_username, watchers, latest, allowed):
 
 
 def run_price_loop(tg, watchers, latest):
-    detector = DropDetector(DROP_USD, WINDOW_SECONDS, COOLDOWN_SECONDS)
+    detectors = {tier: DropDetector(drop, window, COOLDOWN_SECONDS) for tier, (drop, window) in TIERS.items()}
     first_failure = None
     feed_down_sent = False
     next_status = 0.0
@@ -251,27 +275,30 @@ def run_price_loop(tg, watchers, latest):
             first_failure = first_failure or started
             log(f"price read failed: {e}")
             if not feed_down_sent and started - first_failure >= FEED_DOWN_AFTER:
-                broadcast(tg, watchers, f"⚠️ BTC price feed DOWN for {FEED_DOWN_AFTER}s, alerts paused. Last error: {e}")
+                broadcast(tg, watchers.chats(), f"⚠️ BTC price feed DOWN for {FEED_DOWN_AFTER}s, alerts paused. Last error: {e}")
                 feed_down_sent = True
             time.sleep(max(POLL_INTERVAL, 5))
             continue
         if feed_down_sent:
-            broadcast(tg, watchers, f"BTC price feed recovered, alerts resumed. {price_line(latest)}")
+            broadcast(tg, watchers.chats(), f"BTC price feed recovered, alerts resumed. {price_line(latest)}")
         first_failure, feed_down_sent = None, False
         latest.mid, latest.at = mid, started
 
-        hit = detector.update(started, mid)
-        if hit:
-            secs, high = hit
-            text = (
-                f"🚨 BTC down ${high - mid:,.0f} in {secs:.0f}s\n"
-                f"${high:,.1f} → ${mid:,.1f}\n"
-                "Hyperliquid BBO mid (Papertrade's execution price)"
-            )
-            log(f"ALERT to {len(watchers.snapshot())} chat(s): {text!r}")
-            broadcast(tg, watchers, text)
+        for tier, detector in detectors.items():
+            hit = detector.update(started, mid)
+            if hit:
+                secs, high = hit
+                chats = watchers.chats(tier)
+                text = (
+                    f"🚨 BTC down ${high - mid:,.0f} in {secs:.0f}s\n"
+                    f"${high:,.1f} → ${mid:,.1f}\n"
+                    "Hyperliquid BBO mid (Papertrade's execution price)"
+                )
+                log(f"{tier} ALERT to {len(chats)} chat(s): {text!r}")
+                broadcast(tg, chats, text)
         if started >= next_status:
-            log(f"BTC mid ${mid:,.1f}, {len(watchers.snapshot())} chat(s) watching")
+            counts = ", ".join(f"{len(watchers.chats(t))} {t}" for t in TIERS)
+            log(f"BTC mid ${mid:,.1f}, chats watching: {counts}")
             next_status = started + 60
 
         time.sleep(max(0.0, POLL_INTERVAL - (time.monotonic() - started)))
@@ -298,11 +325,12 @@ def main():
 
     watchers = Watchers(STATE_FILE)
     latest = SimpleNamespace(mid=None, at=0.0)
-    log(f"@{bot_username} up: alerting on a {TRIGGER} via BBO precompile on {RPC_URL}")
-    log(f"{len(watchers.snapshot())} chat(s) watching, state in {STATE_FILE}")
+    tiers = ", ".join(f"{t} = {trigger(t)}" for t in TIERS)
+    log(f"@{bot_username} up: tiers {tiers}, via BBO precompile on {RPC_URL}")
+    log(f"{len(watchers.chats())} chat(s) watching, state in {STATE_FILE}")
     if allowed:
         log(f"only accepting commands from chats {sorted(allowed)}")
-    broadcast(tg, watchers, "Hyper Reader restarted. Still watching BTC here. Send /watch off to stop.")
+    broadcast(tg, watchers.chats(), "Hyper Reader restarted. Still watching BTC here. Send /watch status to see your tier.")
 
     threading.Thread(target=run_bot, args=(tg, bot_username, watchers, latest, allowed), daemon=True).start()
     run_price_loop(tg, watchers, latest)
