@@ -8,6 +8,7 @@ alerts the chats on that tier when the current mid falls far enough below it.
 
 Telegram commands:
   /watch          start alerts in this chat (normal tier)
+  /watch drastic  only alert on drastic moves (drastic tier)
   /watch off      stop alerts in this chat
   /watch status   show this chat's tier, plus the current price
 
@@ -16,6 +17,8 @@ Environment:
   TELEGRAM_ALLOWED_CHATS   optional comma-separated chat IDs; commands from other chats are ignored
   NORMAL_DROP_USD          normal tier: USD drop that triggers an alert (default 1000)
   NORMAL_WINDOW_SECONDS    normal tier: lookback window in seconds (default 60)
+  DRASTIC_DROP_USD         drastic tier: USD drop that triggers an alert (default 500)
+  DRASTIC_WINDOW_SECONDS   drastic tier: lookback window in seconds (default 10)
   ALERT_COOLDOWN_SECONDS   min seconds between alerts in a tier (default 120)
   POLL_INTERVAL_SECONDS    seconds between price reads (default 1)
   STATE_FILE               where watching chats are saved (default watchers.json)
@@ -40,7 +43,10 @@ FEED_DOWN_AFTER = 60  # seconds of failed reads before alerting that the feed is
 
 # Each watching chat is on one tier: name -> (USD drop, lookback window in seconds).
 # Override a tier with <NAME>_DROP_USD and <NAME>_WINDOW_SECONDS.
-TIER_DEFAULTS = {"normal": (1000, 60)}
+TIER_DEFAULTS = {
+    "normal": (1000, 60),
+    "drastic": (500, 10),  # sudden crashes only: flash wicks and liquidation cascades
+}
 DEFAULT_TIER = "normal"
 TIERS = {
     name: (
@@ -315,7 +321,7 @@ def main():
     while True:
         try:
             bot_username = tg.call("getMe")["username"]
-            tg.call("setMyCommands", commands=[{"command": "watch", "description": "BTC drop alerts: /watch, /watch off, /watch status"}])
+            tg.call("setMyCommands", commands=[{"command": "watch", "description": "BTC drop alerts: /watch, /watch drastic, /watch off, /watch status"}])
             break
         except Exception as e:
             if isinstance(e, HTTPStatusError) and e.status in (401, 404):
