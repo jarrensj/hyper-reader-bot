@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Hyper Oracle: Telegram bot that alerts on sharp BTC drops, priced off Papertrade's oracle.
+"""Hyper Reader: Telegram bot that alerts on sharp BTC drops, priced off Papertrade's oracle.
 
 Papertrade's PriceOracle reads Hyperliquid's BBO precompile on HyperEVM
 (0x...080e) and executes at the bid/ask mid. This bot makes the same read via
@@ -46,7 +46,7 @@ STATE_FILE = os.environ.get("STATE_FILE", "watchers.json")
 
 TRIGGER = f"${DROP_USD:,.0f} drop within {WINDOW_SECONDS:.0f}s"
 HELP = (
-    f"Hyper Oracle: BTC drop alerts on a {TRIGGER}, priced off Hyperliquid's BBO mid "
+    f"Hyper Reader: BTC drop alerts on a {TRIGGER}, priced off Hyperliquid's BBO mid "
     "(the price Papertrade executes at).\n\n"
     "/watch - start alerts in this chat\n"
     "/watch off - stop alerts\n"
@@ -58,6 +58,12 @@ def log(msg):
     print(f"[{datetime.now():%Y-%m-%d %H:%M:%S}] {msg}", flush=True)
 
 
+class HTTPStatusError(RuntimeError):
+    def __init__(self, status, body):
+        super().__init__(f"HTTP {status}: {body}")
+        self.status = status
+
+
 def post_json(url, payload, timeout=10):
     req = urllib.request.Request(url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"})
     try:
@@ -65,7 +71,7 @@ def post_json(url, payload, timeout=10):
             return json.loads(resp.read())
     except urllib.error.HTTPError as e:
         # Telegram puts the useful part ("Unauthorized", "chat not found", ...) in the body.
-        raise RuntimeError(f"HTTP {e.code}: {e.read().decode(errors='replace')[:300]}") from None
+        raise HTTPStatusError(e.code, e.read().decode(errors="replace")[:300]) from None
 
 
 def read_bbo(asset=BTC_ASSET, scale=BTC_PX_SCALE):
@@ -278,11 +284,17 @@ def main():
     allowed = {int(c) for c in os.environ.get("TELEGRAM_ALLOWED_CHATS", "").replace(",", " ").split()}
 
     tg = Telegram(token)
-    try:
-        bot_username = tg.call("getMe")["username"]
-    except Exception as e:
-        sys.exit(f"Telegram rejected TELEGRAM_BOT_TOKEN: {e}")
-    tg.call("setMyCommands", commands=[{"command": "watch", "description": "BTC drop alerts: /watch, /watch off, /watch status"}])
+    # Wait out network blips here instead of exiting, so they don't burn Railway's restart retries.
+    while True:
+        try:
+            bot_username = tg.call("getMe")["username"]
+            tg.call("setMyCommands", commands=[{"command": "watch", "description": "BTC drop alerts: /watch, /watch off, /watch status"}])
+            break
+        except Exception as e:
+            if isinstance(e, HTTPStatusError) and e.status in (401, 404):
+                sys.exit(f"Telegram rejected TELEGRAM_BOT_TOKEN: {e}")
+            log(f"Telegram startup call failed, retrying in 10s: {e}")
+            time.sleep(10)
 
     watchers = Watchers(STATE_FILE)
     latest = SimpleNamespace(mid=None, at=0.0)
@@ -290,7 +302,7 @@ def main():
     log(f"{len(watchers.snapshot())} chat(s) watching, state in {STATE_FILE}")
     if allowed:
         log(f"only accepting commands from chats {sorted(allowed)}")
-    broadcast(tg, watchers, "Hyper Oracle restarted. Still watching BTC here. Send /watch off to stop.")
+    broadcast(tg, watchers, "Hyper Reader restarted. Still watching BTC here. Send /watch off to stop.")
 
     threading.Thread(target=run_bot, args=(tg, bot_username, watchers, latest, allowed), daemon=True).start()
     run_price_loop(tg, watchers, latest)
